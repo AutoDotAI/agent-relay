@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: agent-relay
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: agent-relay-database
+  namespace: agent-relay
+type: Opaque
+stringData:
+  POSTGRES_DB: agent_relay
+  POSTGRES_USER: relay
+  POSTGRES_PASSWORD: relay-local
+  RELAY_DATABASE_URL: postgresql+psycopg://relay:relay-local@postgres:5432/agent_relay

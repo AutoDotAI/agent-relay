@@ -1,19 +1,19 @@
-"""Protocol tests for the SQLite starter.
+"""Protocol tests using isolated SQLite by default.
 
 These tests intentionally exercise storage calls from multiple threads: that
 is the closest local equivalent to several worker processes racing to claim an
-inbox.  The production guarantee comes from SQLite's BEGIN IMMEDIATE boundary,
-not from a Python lock.
+inbox. SQLite tests use BEGIN IMMEDIATE; PostgreSQL coordinates claims with
+row-level locks.
 """
 
 from __future__ import annotations
 
 import os
 
-# Default to a scratch DB so `pytest` never resets the dev server's
-# `./agent-relay.db`. Respect an explicit RELAY_DATABASE_URL/DATABASE_URL
-# (e.g. CI pointing at PostgreSQL), but otherwise isolate tests.
-os.environ.setdefault("RELAY_DATABASE_URL", "sqlite:////tmp/agent-relay-test.db")
+# Default to a scratch SQLite DB so `pytest` needs no server and never resets a
+# development database. Respect an explicit RELAY_DATABASE_URL or DATABASE_URL.
+if not os.getenv("RELAY_DATABASE_URL") and not os.getenv("DATABASE_URL"):
+    os.environ["RELAY_DATABASE_URL"] = "sqlite:////tmp/agent-relay-test.db"
 
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
@@ -41,6 +41,64 @@ def register(client: TestClient, name: str) -> tuple[dict, dict[str, str]]:
     assert response.status_code == 201
     data = response.json()
     return data, {"Authorization": f"Bearer {data['token']}"}
+
+
+def test_acceptance_agents_exchange_task_through_api_and_database():
+    """Exercise the first SPEC acceptance scenario through the real API and test DB."""
+    with TestClient(main.app) as client:
+        sender, sender_headers = register(client, "alice-integration")
+        recipient, recipient_headers = register(client, "uppercase-integration")
+
+        sent = client.post(
+            "/api/v1/tasks",
+            headers=sender_headers,
+            json={"to": recipient["agent_id"], "input": "hello relay"},
+        )
+        assert sent.status_code == 201
+        task_id = sent.json()["task_id"]
+
+        # The API write is persisted in the real test database.
+        with db_session() as db:
+            stored_task = db.get(Task, task_id)
+            assert stored_task is not None
+            assert stored_task.sender_id == sender["agent_id"]
+            assert stored_task.recipient_id == recipient["agent_id"]
+            assert stored_task.status == "queued"
+
+        claim_response = client.post(
+            "/api/v1/tasks/claim",
+            headers=recipient_headers,
+            json={"worker_id": "uppercase-integration-worker", "wait_seconds": 0},
+        )
+        assert claim_response.status_code == 200
+        claim = claim_response.json()
+        assert claim["task_id"] == task_id
+        assert claim["from"] == sender["agent_id"]
+        assert claim["input"] == "hello relay"
+
+        output = claim["input"].upper()
+        completion = client.post(
+            f"/api/v1/tasks/{task_id}/complete",
+            headers=recipient_headers,
+            json={"claim_token": claim["claim_token"], "output": output},
+        )
+        assert completion.status_code == 200
+        assert completion.json() == {"task_id": task_id, "status": "completed"}
+
+        result = client.get(f"/api/v1/tasks/{task_id}", headers=sender_headers)
+        assert result.status_code == 200
+        assert result.json()["status"] == "completed"
+        assert result.json()["output"] == "HELLO RELAY"
+
+        # Confirm that both the final task state and delivery attempt were committed.
+        with db_session() as db:
+            stored_task = db.get(Task, task_id)
+            attempt = db.query(Attempt).filter(Attempt.task_id == task_id).one()
+            assert stored_task is not None
+            assert stored_task.status == "completed"
+            assert stored_task.output == "HELLO RELAY"
+            assert attempt.outcome == "completed"
+            assert attempt.worker_id == "uppercase-integration-worker"
 
 
 def test_protocol_idempotency_terminal_retry_and_auth_boundary():

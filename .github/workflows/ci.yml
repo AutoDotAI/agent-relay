@@ -1,0 +1,120 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      kind_cluster:
+        description: Existing kind cluster name to deploy to (defaults to a fresh CI cluster)
+        required: false
+        default: agent-relay-ci
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Tests against PostgreSQL
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_DB: agent_relay_test
+          POSTGRES_USER: relay
+          POSTGRES_PASSWORD: relay-local
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U relay -d agent_relay_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      RELAY_DATABASE_URL: postgresql+psycopg://relay:relay-local@localhost:5432/agent_relay_test
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        with:
+          version: latest-known
+
+      - name: Install Python and project dependencies
+        run: |
+          uv python install 3.12
+          uv sync --frozen
+
+      - name: Run starter suite and API integration tests
+        run: uv run pytest -q
+
+  build-and-deploy:
+    name: Build and deploy to kind
+    needs: test
+    if: needs.test.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      KIND_CLUSTER: ${{ github.event.inputs.kind_cluster || 'agent-relay-ci' }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install kind and kubectl
+        shell: bash
+        run: |
+          set -euo pipefail
+          kind_release=v0.33.0
+          kubectl_release=v1.37.1
+
+          curl -fsSLo kind "https://kind.sigs.k8s.io/dl/${kind_release}/kind-linux-amd64"
+          chmod +x kind
+          sudo install -m 0755 kind /usr/local/bin/kind
+
+          curl -fsSLo kubectl "https://dl.k8s.io/release/${kubectl_release}/bin/linux/amd64/kubectl"
+          curl -fsSLo kubectl.sha256 "https://dl.k8s.io/release/${kubectl_release}/bin/linux/amd64/kubectl.sha256"
+          printf '%s  %s\n' "$(cat kubectl.sha256)" kubectl | sha256sum --check
+          sudo install -m 0755 kubectl /usr/local/bin/kubectl
+
+      - name: Build relay image
+        run: docker build -t agent-relay:local .
+
+      - name: Create kind cluster if needed
+        run: |
+          if ! kind get clusters | grep -Fxq "$KIND_CLUSTER"; then
+            kind create cluster --name "$KIND_CLUSTER" --wait 120s
+          fi
+          kubectl config use-context "kind-$KIND_CLUSTER"
+
+      - name: Load relay image into kind
+        run: kind load docker-image agent-relay:local --name "$KIND_CLUSTER"
+
+      - name: Deploy PostgreSQL and Agent Relay
+        run: |
+          kubectl apply -f k8s/
+          kubectl rollout status deployment/postgres -n agent-relay --timeout=180s
+          kubectl rollout restart deployment/agent-relay -n agent-relay
+          kubectl rollout status deployment/agent-relay -n agent-relay --timeout=180s
+
+      - name: Check deployed API readiness
+        shell: bash
+        run: |
+          set -euo pipefail
+          kubectl port-forward --address 127.0.0.1 -n agent-relay service/agent-relay 8000:8000 \
+            >"${RUNNER_TEMP}/agent-relay-port-forward.log" 2>&1 &
+          port_forward_pid=$!
+          trap 'kill "$port_forward_pid" 2>/dev/null || true' EXIT
+
+          for attempt in {1..30}; do
+            if curl --fail --silent http://127.0.0.1:8000/ready; then
+              exit 0
+            fi
+            sleep 2
+          done
+
+          cat "${RUNNER_TEMP}/agent-relay-port-forward.log"
+          exit 1

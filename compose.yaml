@@ -1,0 +1,30 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: agent_relay
+      POSTGRES_USER: relay
+      POSTGRES_PASSWORD: relay-local
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U relay -d agent_relay"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+  relay:
+    image: agent-relay:local
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      RELAY_DATABASE_URL: postgresql+psycopg://relay:relay-local@postgres:5432/agent_relay
+    ports:
+      - "127.0.0.1:8002:8000"
+
+volumes:
+  postgres-data:

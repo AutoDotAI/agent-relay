@@ -1,9 +1,7 @@
 """Persistence operations for Agent Relay.
 
-Routes and the worker call these functions instead of issuing SQL directly.
-Claim, heartbeat, terminal submission, and recovery each use the same atomic
-SQLite transaction seam, which is the one area students will later replace by
-PostgreSQL row-locking operations.
+Routes and workers call these functions instead of issuing SQL directly.
+PostgreSQL row locks coordinate claims, heartbeats, completion, and recovery.
 """
 
 from __future__ import annotations
@@ -29,11 +27,11 @@ from database import (
     as_db_time,
     db_session,
     db_time,
-    immediate_transaction,
     iso_time,
     recover_expired,
     recover_expired_in_session,
     utcnow,
+    write_transaction,
 )
 from errors import RelayError
 
@@ -74,11 +72,9 @@ def register_agent(name: str, description: str | None) -> dict[str, str]:
 
 def authenticate(token: str) -> Agent:
     token_digest = secret_hash(token)
-    # last_seen_at is an authenticated observation and therefore a write.  Use
-    # the same writer boundary as task operations so concurrent workers do not
-    # hold stale WAL snapshots while trying to update it.
-    with immediate_transaction() as db:
-        agent = db.scalar(select(Agent).where(Agent.token_hash == token_digest))
+    # last_seen_at is an authenticated observation and therefore a write.
+    with write_transaction() as db:
+        agent = db.scalar(select(Agent).where(Agent.token_hash == token_digest).with_for_update())
         if agent is None or not hmac.compare_digest(agent.token_hash, token_digest):
             raise RelayError("invalid_credentials", "The agent token is invalid.", 401)
         agent.last_seen_at = as_db_time(utcnow())
@@ -104,9 +100,9 @@ def list_agents(limit: int, cursor: tuple[datetime, str] | None) -> tuple[list[A
 
 
 def create_task(sender_id: str, recipient_id: str, input_text: str, idempotency_key: str | None) -> dict[str, str]:
-    # Serializing task creation makes the sender-scoped idempotency check and
-    # unique constraint one operation even when two API processes race.
-    with immediate_transaction() as db:
+    # Lock the sender so concurrent idempotency checks for this sender serialize.
+    with write_transaction() as db:
+        db.scalar(select(Agent.id).where(Agent.id == sender_id).with_for_update())
         recipient = db.get(Agent, recipient_id)
         if recipient is None:
             raise RelayError("not_found", "Recipient agent not found.", 404)
@@ -141,7 +137,7 @@ def create_task(sender_id: str, recipient_id: str, input_text: str, idempotency_
 
 
 def claim_one(agent_id: str, worker_id: str | None) -> dict[str, Any] | None:
-    with immediate_transaction() as db:
+    with write_transaction() as db:
         now = utcnow()
         recover_expired_in_session(db, now)
         task = db.scalar(
@@ -149,6 +145,7 @@ def claim_one(agent_id: str, worker_id: str | None) -> dict[str, Any] | None:
             .where(Task.recipient_id == agent_id, Task.status == "queued")
             .order_by(Task.created_at, Task.id)
             .limit(1)
+            .with_for_update(skip_locked=True)
         )
         if task is None:
             return None
@@ -187,18 +184,21 @@ def claim_one(agent_id: str, worker_id: str | None) -> dict[str, Any] | None:
         }
 
 
-def _find_attempt_for_token(db: Session, task_id: str, token: str) -> Attempt | None:
-    return db.scalar(
-        select(Attempt).where(Attempt.task_id == task_id, Attempt.claim_token_hash == secret_hash(token))
+def _find_attempt_for_token(db: Session, task_id: str, token: str, *, for_update: bool = False) -> Attempt | None:
+    statement = select(Attempt).where(
+        Attempt.task_id == task_id, Attempt.claim_token_hash == secret_hash(token)
     )
+    if for_update:
+        statement = statement.with_for_update()
+    return db.scalar(statement)
 
 
 def heartbeat(task_id: str, agent_id: str, claim_token: str) -> str:
-    with immediate_transaction() as db:
-        task = db.get(Task, task_id)
+    with write_transaction() as db:
+        task = db.scalar(select(Task).where(Task.id == task_id).with_for_update())
         if task is None or task.recipient_id != agent_id:
             raise RelayError("not_found", "Task not found.", 404)
-        attempt = _find_attempt_for_token(db, task_id, claim_token)
+        attempt = _find_attempt_for_token(db, task_id, claim_token, for_update=True)
         now = utcnow()
         if (
             attempt is None
@@ -221,11 +221,11 @@ def commit_terminal(
     action: Literal["complete", "fail"],
     value: str,
 ) -> dict[str, str]:
-    with immediate_transaction() as db:
-        task = db.get(Task, task_id)
+    with write_transaction() as db:
+        task = db.scalar(select(Task).where(Task.id == task_id).with_for_update())
         if task is None or task.recipient_id != agent_id:
             raise RelayError("not_found", "Task not found.", 404)
-        attempt = _find_attempt_for_token(db, task_id, claim_token)
+        attempt = _find_attempt_for_token(db, task_id, claim_token, for_update=True)
         if attempt is None:
             raise RelayError("stale_claim", "This claim is no longer active.", 409)
         value_digest = payload_hash(value)
